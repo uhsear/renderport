@@ -56,6 +56,7 @@ ZOOM0_SCALE = 591657527.591555 / 2.0
 MAX_ZOOM = 24.0  # MapLibre minzoom and maxzoom range 0 to 24
 FETCH_LIMIT = 10 * 1024 * 1024  # bytes read from one layer answer
 FETCH_TIMEOUT = 30  # seconds
+_OPEN = urllib.request.urlopen  # the self-test swaps in an opener that ignores proxy settings
 
 # rule id -> (can be accepted with --accept, what is refused and why)
 RULES = {
@@ -80,7 +81,7 @@ RULES = {
     "R-FIELD-TYPE": (False, "the renderer field is not in the layer fields, or its type cannot be matched safely"),
     "R-CB-NORMALIZE": (False, "normalized class breaks are not carried"),
     "R-CB-BOUNDARY": (True, "the Esri reference does not say whether a class bound is inclusive, so a value on a bound may take the wrong class"),
-    "R-CB-ORDER": (False, "class bounds must rise strictly from minValue"),
+    "R-CB-ORDER": (False, "class bounds must rise strictly from minValue, and each classMinValue must equal the bound before it, because the tool rebuilds contiguous classes and a gap or overlap would draw in the wrong class"),
     "R-LABELS": (False, "label placement and label expressions are not carried"),
     "R-SCALE-SYMBOLS": (False, "symbols that scale with the map are not carried"),
     "R-SCALE-RANGE": (True, "the Esri reference does not define the direction of minScale and maxScale or the meaning of 0, and a scale-to-zoom conversion assumes 96 dpi"),
@@ -115,6 +116,9 @@ _KINDS = {
     "esriFieldTypeDouble": "float", "esriFieldTypeSingle": "float",
 }
 _INT_RE = re.compile(r"^-?[0-9]+$")
+# Largest whole number a JSON reader keeps exact (2^53 - 1). MapLibre match labels must be whole
+# numbers in this range, and a larger class value would round in the tile attribute and the filter.
+MAX_EXACT_INT = 9007199254740991
 _ROUND = {"line-cap": "round", "line-join": "round"}
 
 
@@ -309,7 +313,11 @@ def _typed(value, kind):
     if kind == "string":
         return value
     if kind == "int":
-        return int(value) if _INT_RE.match(value) else None
+        # The length test comes first: int() raises ValueError on a string of more than 4300 digits.
+        if not _INT_RE.match(value) or len(value) > 20:
+            return None
+        number = int(value)
+        return number if abs(number) <= MAX_EXACT_INT else None
     try:
         number = float(value)
     except ValueError:
@@ -328,28 +336,38 @@ def _simple(r, geom, info, factor, ctx):
     return [(r.get("label"), None, r.get("symbol"), "renderer.symbol")]
 
 
+def _other_than(get, values, kind):
+    """The filter for 'none of these class values': the default class."""
+    if kind == "float":
+        # A MapLibre match rejects a numeric label that is not a whole number, so a double
+        # field uses a chain of != instead.
+        return ["all"] + [["!=", get, v] for v in values]
+    return ["!", ["match", get, list(values), True, False]]
+
+
 def _unique(r, geom, info, factor, ctx):
+    """Every refusal under the renderer is reported, so a refused renderer still has its symbols read."""
     _renderer_common(r, _UV_KEYS, ctx)
-    stop = False
-    if r.get("valueExpression"):
+    ok = True  # False once no filter can be built; the symbols are still checked
+    arcade = bool(r.get("valueExpression"))
+    if arcade:
         ctx.refuse("R-UV-ARCADE", "renderer.valueExpression")
-        stop = True
+        ok = False
     if r.get("uniqueValueGroups"):
         ctx.refuse("R-UV-GROUPS", "renderer.uniqueValueGroups")
-        stop = True
+        ok = False
     if r.get("field2") or r.get("field3"):
         ctx.refuse("R-UV-MULTIFIELD", "renderer.field2")
-        stop = True
-    if stop:
-        return []
-    kind = _field_kind(r.get("field1"), info, ("string", "int", "float"), ctx, "renderer.field1")
+        ok = False
+    # An Arcade renderer has no field1, so a field check would only add noise.
+    kind = None if arcade else _field_kind(r.get("field1"), info, ("string", "int", "float"), ctx, "renderer.field1")
     if kind is None:
-        return []
+        ok = False
     infos = r.get("uniqueValueInfos") or []
     if not isinstance(infos, list):
         ctx.refuse("R-VALUE", "renderer.uniqueValueInfos", "not a list")
         return []
-    field = r["field1"]
+    get = ["get", r.get("field1")]
     specs = []
     seen = []
     for i, item in enumerate(infos):
@@ -357,18 +375,22 @@ def _unique(r, geom, info, factor, ctx):
         if not isinstance(item, dict):
             ctx.refuse("R-VALUE", where, "not an object")
             continue
-        typed = _typed(item.get("value"), kind)
-        if typed is None:
-            ctx.refuse("R-VALUE", where, "value %s does not parse as %s" % (json.dumps(item.get("value")), kind))
-            continue
-        if typed in seen:
-            ctx.refuse("R-VALUE", where, "value %s repeats an earlier class" % json.dumps(item.get("value")))
-            continue
-        seen.append(typed)
-        specs.append((item.get("label"), ["==", ["get", field], typed], item.get("symbol"), where + ".symbol"))
+        filt = None
+        if ok:
+            typed = _typed(item.get("value"), kind)
+            if typed is None:
+                ctx.refuse("R-VALUE", where, "value %s does not parse as %s%s" % (
+                    json.dumps(item.get("value")), kind, " (whole numbers up to %d only)" % MAX_EXACT_INT if kind == "int" else ""))
+                continue
+            if typed in seen:
+                ctx.refuse("R-VALUE", where, "value %s repeats an earlier class" % json.dumps(item.get("value")))
+                continue
+            seen.append(typed)
+            filt = ["==", get, typed]
+        specs.append((item.get("label"), filt, item.get("symbol"), where + ".symbol"))
     default = r.get("defaultSymbol")
     if default is not None:
-        filt = ["!", ["match", ["get", field], list(seen), True, False]] if seen else None
+        filt = _other_than(get, seen, kind) if ok and seen else None
         specs.append((r.get("defaultLabel"), filt, default, "renderer.defaultSymbol"))
     if not specs and not ctx.refusals:
         ctx.refuse("R-VALUE", "renderer", "no classes and no defaultSymbol, so nothing would draw")
@@ -376,44 +398,54 @@ def _unique(r, geom, info, factor, ctx):
 
 
 def _breaks(r, geom, info, factor, ctx):
+    """Every refusal under the renderer is reported, so a refused renderer still has its symbols read."""
     _renderer_common(r, _CB_KEYS, ctx)
+    ok = True  # False once no filter can be built; the symbols are still checked
     if any(r.get(k) for k in ("normalizationType", "normalizationField", "normalizationTotal")):
         ctx.refuse("R-CB-NORMALIZE", "renderer.normalizationType")
-        return []
-    kind = _field_kind(r.get("field"), info, ("int", "float"), ctx, "renderer.field")
-    if kind is None:
-        return []
+        ok = False
+    if _field_kind(r.get("field"), info, ("int", "float"), ctx, "renderer.field") is None:
+        ok = False
     ctx.approx("R-CB-BOUNDARY", "renderer.classBreakInfos", "taking each class as (previous max, max], the first as [minValue, max]")
     low = r.get("minValue")
     infos = r.get("classBreakInfos")
     if not _num(low) or not isinstance(infos, list) or not infos:
         ctx.refuse("R-VALUE", "renderer", "need a numeric minValue and a non-empty classBreakInfos list")
+        ok = False
+    if not isinstance(infos, list):
         return []
-    get = ["get", r["field"]]
+    get = ["get", r.get("field")]
     specs = []
     prev = low
     for i, item in enumerate(infos):
         where = "renderer.classBreakInfos[%d]" % i
-        if not isinstance(item, dict) or not _num(item.get("classMaxValue")):
+        top = item.get("classMaxValue") if isinstance(item, dict) else None
+        if not _num(top):
             ctx.refuse("R-VALUE", where, "classMaxValue must be a number")
-            return []
-        top = item["classMaxValue"]
-        mine = item.get("classMinValue")
-        if mine is not None and (not _num(mine) or mine > top):
-            ctx.refuse("R-VALUE", where, "classMinValue %s is not a number at or below classMaxValue" % json.dumps(mine))
-            return []
-        if (top < prev) if i == 0 else (top <= prev):
-            ctx.refuse("R-CB-ORDER", where, "classMaxValue %s after %s" % (json.dumps(top), json.dumps(prev)))
-            return []
-        lower = [">=", get, low] if i == 0 else [">", get, prev]
-        specs.append((item.get("label"), ["all", ["!=", get, None], lower, ["<=", get, top]],
-                      item.get("symbol"), where + ".symbol"))
-        prev = top
+            ok = False
+        elif ok:
+            mine = item.get("classMinValue")
+            if mine is not None and (not _num(mine) or mine > top):
+                ctx.refuse("R-VALUE", where, "classMinValue %s is not a number at or below classMaxValue" % json.dumps(mine))
+                ok = False
+            elif (top < prev) if i == 0 else (top <= prev):
+                ctx.refuse("R-CB-ORDER", where, "classMaxValue %s after %s" % (json.dumps(top), json.dumps(prev)))
+                ok = False
+            elif mine is not None and mine != prev:
+                ctx.refuse("R-CB-ORDER", where, "classMinValue %s does not meet the bound before it, %s" % (json.dumps(mine), json.dumps(prev)))
+                ok = False
+        if not isinstance(item, dict):
+            continue
+        filt = None
+        if ok:
+            lower = [">=", get, low] if i == 0 else [">", get, prev]
+            filt = ["all", ["!=", get, None], lower, ["<=", get, top]]
+            prev = top
+        specs.append((item.get("label"), filt, item.get("symbol"), where + ".symbol"))
     default = r.get("defaultSymbol")
     if default is not None:
-        specs.append((r.get("defaultLabel"),
-                      ["any", ["==", get, None], ["<", get, low], [">", get, prev]],
-                      default, "renderer.defaultSymbol"))
+        filt = ["any", ["==", get, None], ["<", get, low], [">", get, prev]] if ok else None
+        specs.append((r.get("defaultLabel"), filt, default, "renderer.defaultSymbol"))
     return specs
 
 
@@ -438,13 +470,19 @@ def _layer_checks(info, di, ctx):
     lo = info.get("minScale", 0)
     hi = info.get("maxScale", 0)
     minzoom = maxzoom = None
-    if not (_num(lo) and _num(hi) and lo >= 0 and hi >= 0 and (lo == 0 or hi == 0 or lo >= hi)):
+    if not (_num(lo) and _num(hi) and lo >= 0 and hi >= 0 and (lo == 0 or lo >= hi)):
         ctx.refuse("R-VALUE", "minScale", "minScale %s, maxScale %s" % (json.dumps(lo), json.dumps(hi)))
     elif (lo or hi) and ctx.approx("R-SCALE-RANGE", "minScale", "minScale %s, maxScale %s; reading minScale as the zoomed-out limit and 0 as no limit" % (json.dumps(lo), json.dumps(hi))):
-        if lo:
-            minzoom = max(0.0, _zoom(lo))
-        if hi:
-            maxzoom = min(MAX_ZOOM, _zoom(hi))
+        # A minzoom below 0 and a maxzoom above 24 are clamped, because no zoom is outside 0 to 24.
+        # The other two ends are not clamped: a range with no zoom level in it never draws.
+        low_z = max(0.0, _zoom(lo)) if lo else 0.0
+        high_z = min(MAX_ZOOM, _zoom(hi)) if hi else MAX_ZOOM
+        if low_z >= high_z:
+            ctx.refuse("R-VALUE", "minScale", "minScale %s, maxScale %s hold no zoom level (%s to %s), so the layer would never draw" % (
+                json.dumps(lo), json.dumps(hi), _fmt(low_z), _fmt(high_z)))
+        else:
+            minzoom = low_z if lo else None
+            maxzoom = high_z if hi else None
     return factor, minzoom, maxzoom
 
 
@@ -534,7 +572,7 @@ def _fetch(url, limit=FETCH_LIMIT):
         raise ValueError("only http and https URLs are read, got %r" % parts.scheme)
     query = [(k, v) for k, v in urllib.parse.parse_qsl(parts.query) if k != "f"] + [("f", "json")]
     target = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
-    with contextlib.closing(urllib.request.urlopen(target, timeout=FETCH_TIMEOUT)) as resp:
+    with contextlib.closing(_OPEN(target, timeout=FETCH_TIMEOUT)) as resp:
         body = resp.read(limit + 1)
     if len(body) > limit:
         raise ValueError("the answer is larger than %d bytes" % limit)
@@ -587,6 +625,9 @@ def _eval(expr, props):
         pairs = args[1:-1]
         for i in range(0, len(pairs), 2):
             for label in pairs[i]:
+                # The style validator rejects a numeric label that is not a whole number in the exact range.
+                if _tkind(label) == "number" and not (float(label).is_integer() and abs(label) <= MAX_EXACT_INT):
+                    raise ValueError("expression error: numeric match labels must be whole numbers")
                 if _tkind(value) == _tkind(label) and value == label:
                     return pairs[i + 1]
         return args[-1]
@@ -676,15 +717,25 @@ class _Harness(object):
             self.failed.append(label)
             print("FAIL  %s" % label)
 
-    def raises(self, fn, label):
+    def raises(self, fn, label, text=""):
+        """check() that fn raises ValueError whose message holds text."""
         try:
             fn()
-        except ValueError:
-            self.check(True, label)
+        except ValueError as exc:
+            self.check(text in str(exc), label)
         except Exception as exc:
             self.check(False, "%s (wrong exception %r)" % (label, exc))
         else:
             self.check(False, "%s (no error raised)" % label)
+
+    def holds(self, fn, label):
+        """check() of fn(), where an exception is a failure and not a crash of the self-test."""
+        try:
+            ok = fn()
+        except Exception as exc:
+            self.check(False, "%s (raised %r)" % (label, exc))
+        else:
+            self.check(ok, label)
 
     def footer(self):
         print("-" * 68)
@@ -708,6 +759,9 @@ class _Stub(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.seen.append(self.path)
+        if self.path.startswith("/garbage"):
+            self.wfile.write(b"this is not an http status line\r\n\r\n")
+            return
         status, body = self.routes.get(self.path.split("?")[0], (404, b"not found"))
         self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
@@ -731,8 +785,9 @@ def _run(argv):
 
 def self_test():
     """Assertions over the decision core, the parser and the file and network paths."""
+    global _OPEN
     h = _Harness()
-    check, raises = h.check, h.raises
+    check, raises, holds = h.check, h.raises, h.holds
     ms = ["R-MARKER-SIZE"]
 
     def conv(info, accepted=(), **kw):
@@ -750,10 +805,13 @@ def self_test():
         probe.raises(lambda: 1, "c")
         probe.raises(lambda: (_ for _ in ()).throw(KeyError("x")), "d")
         probe.raises(lambda: (_ for _ in ()).throw(ValueError("x")), "e")
+        probe.holds(lambda: True, "f")
+        probe.holds(lambda: 1 / 0, "g")
         status = probe.footer()
     shown = sink.getvalue()
-    check(status == 1 and "2 assertions" not in shown and "5 assertions, 3 failed" in shown and "FAILED: b" in shown
-          and "FAIL  c (no error raised)" in shown and "wrong exception" in shown and "PASS  e" in shown,
+    check(status == 1 and "2 assertions" not in shown and "7 assertions, 4 failed" in shown and "FAILED: b" in shown
+          and "FAIL  c (no error raised)" in shown and "wrong exception" in shown and "PASS  e" in shown
+          and "PASS  f" in shown and "FAIL  g (raised ZeroDivisionError" in shown,
           "the harness counts passes and failures, names each failure and exits 1")
 
     # ---- helpers
@@ -780,6 +838,17 @@ def self_test():
           and abs(_zoom(1128.497176) - 18.0) < 1e-4,
           "scale 295828763.8 (Esri level 1) is MapLibre zoom 0, and Esri level 19 (1128.5) is zoom 18" + PIN)
     check(_s(["x"]) == "" and _s("x") == "x", "_s keeps strings and blanks everything else")
+    check(_typed("9007199254740991", "int") == MAX_EXACT_INT and _typed("-9007199254740991", "int") == -MAX_EXACT_INT
+          and _typed("9007199254740992", "int") is None and _typed("-9007199254740992", "int") is None,
+          "an integer class value must be exact in JSON, so 2^53 - 1 is the limit" + PIN)
+    holds(lambda: _typed("9" * 5000, "int") is None and _typed("0" * 21, "int") is None,
+          "a class value of thousands of digits is refused, not an int() crash" + PIN)
+    raises(lambda: _eval(["match", ["get", "A"], [1.5], True, False], {"A": 1}),
+           "the model raises on a numeric match label that is not a whole number, as the style validator does" + PIN)
+    raises(lambda: _eval(["match", ["get", "A"], [MAX_EXACT_INT + 1], True, False], {"A": 1}),
+           "the model raises on a numeric match label beyond 2^53 - 1" + PIN)
+    check(_eval(["match", ["get", "A"], [2.0, "x"], True, False], {"A": 2}) is True,
+          "the model accepts a whole number written as 2.0 as a match label")
 
     # ---- exact conversions, no approximation involved
     res = conv(_simple_pt(), prefix="p")
@@ -818,7 +887,7 @@ def self_test():
           "an accepted line is 3 pt = 4 px wide with round cap and join")
     check(ok.layers[0]["metadata"]["renderport"]["accepted"] == ["R-LINE-CAP-JOIN"],
           "the accepted rule is recorded in the layer metadata")
-    check("ACCEPTED R-LINE-CAP-JOIN" in "\n".join(describe(ok)), "the report lists what was accepted")
+    check("ACCEPTED R-LINE-CAP-JOIN: " + RULES["R-LINE-CAP-JOIN"][1] in describe(ok), "the report lists what was accepted, with the reason")
     outl = _lyr("esriGeometryPolygon", {"type": "simple", "symbol": _sfs(outline=_sls("esriSLSSolid", 0.75))})
     check(rules(outl) == ["R-LINE-CAP-JOIN"], "a polygon outline needs R-LINE-CAP-JOIN too")
     both = conv(outl, accepted=["R-LINE-CAP-JOIN"]).layers
@@ -856,6 +925,23 @@ def self_test():
     sc["minScale"], sc["maxScale"] = ZOOM0_SCALE * 8, ZOOM0_SCALE / 2 ** 40
     z = conv(sc, accepted=["R-SCALE-RANGE"]).layers[0]
     check(z["minzoom"] == 0.0 and z["maxzoom"] == 24.0, "zoom is clamped to MapLibre's 0 to 24")
+    def never_draws(info, label):
+        res = conv(info, accepted=["R-SCALE-RANGE"])
+        check([r[0] for r in res.refusals] == ["R-VALUE"] and "never draw" in res.refusals[0][2] and res.layers == [], label)
+
+    sc["minScale"], sc["maxScale"] = ZOOM0_SCALE / 4, ZOOM0_SCALE / 4
+    never_draws(sc, "minScale equal to maxScale is refused: the range holds no zoom level" + PIN)
+    sc["minScale"], sc["maxScale"] = 1, 0
+    never_draws(sc, "a minScale far below level 24 (minzoom above 24) is refused, not written as minzoom 28" + PIN)
+    sc["minScale"], sc["maxScale"] = 0, 591657527.6
+    never_draws(sc, "a maxScale at the world scale (maxzoom below 0) is refused, not written as maxzoom -1" + PIN)
+    sc["minScale"], sc["maxScale"] = 5e-324, 0
+    never_draws(sc, "a subnormal minScale is refused, not written as the invalid JSON Infinity" + PIN)
+    sc["minScale"], sc["maxScale"] = 0, ZOOM0_SCALE
+    never_draws(sc, "a maxScale at MapLibre level 0 (maxzoom 0, hidden at 0 and above) is refused")
+    sc["minScale"], sc["maxScale"] = ZOOM0_SCALE / 2 ** 23, 0
+    z = conv(sc, accepted=["R-SCALE-RANGE"]).layers[0]
+    check(z["minzoom"] == 23.0 and "maxzoom" not in z, "a minzoom of 23 is inside the 0 to 24 range and is kept")
     sc["minScale"], sc["maxScale"] = 1000, 5000
     check(rules(sc, ["R-SCALE-RANGE"]) == ["R-VALUE"], "minScale below maxScale is refused even when accepted")
     sc["minScale"], sc["maxScale"] = -1, 0
@@ -863,11 +949,31 @@ def self_test():
     sc["minScale"], sc["maxScale"] = "1000", 0
     check(rules(sc, ["R-SCALE-RANGE"]) == ["R-VALUE"], "a text scale is refused")
 
+    nokeys = _simple_pt()
+    del nokeys["minScale"], nokeys["maxScale"]
+    nk = convert(nokeys, accepted=ms)
+    check(not nk.refusals and "minzoom" not in nk.layers[0] and "maxzoom" not in nk.layers[0],
+          "a layer with no minScale or maxScale key draws at every zoom and needs no rule" + PIN)
+    notr = _simple_pt()
+    del notr["drawingInfo"]["transparency"]
+    check(not rules(notr), "a layer with no transparency key has none and needs no rule" + PIN)
+    nooff = _sms()
+    del nooff["xoffset"], nooff["yoffset"]
+    check(not rules(_simple_pt(nooff)), "a marker with no xoffset or yoffset key has no offset" + PIN)
     tr = _simple_pt()
     tr["drawingInfo"]["transparency"] = 60
-    check(rules(tr) == ["R-LAYER-TRANSPARENCY"], "layer transparency is refused until accepted")
+    check(rules(tr) == ["R-LAYER-TRANSPARENCY"] and "multiplying every alpha by 0.4 if accepted" in conv(tr).refusals[0][2],
+          "layer transparency is refused until accepted, and the refusal names the factor it would use")
     tl = conv(tr, accepted=["R-LAYER-TRANSPARENCY"]).layers[0]
     check(tl["paint"]["circle-color"] == "rgba(255,0,0,0.4)", "60 percent transparency multiplies alpha by 0.4")
+    tr["drawingInfo"]["transparency"] = 1
+    check(rules(tr) == ["R-LAYER-TRANSPARENCY"], "transparency 1 is refused until accepted" + PIN)
+    check(conv(tr, accepted=["R-LAYER-TRANSPARENCY"]).layers[0]["paint"]["circle-color"] == "rgba(255,0,0,0.99)",
+          "transparency 1 multiplies alpha by 0.99" + PIN)
+    tr["drawingInfo"]["transparency"] = 100
+    t100 = conv(tr, accepted=["R-LAYER-TRANSPARENCY"])
+    check(not t100.refusals and t100.layers[0]["paint"]["circle-color"] == "rgba(255,0,0,0)",
+          "transparency 100 is accepted and makes alpha 0")
     for badt in (-1, 101, "5", True):
         tr["drawingInfo"]["transparency"] = badt
         check(rules(tr, ["R-LAYER-TRANSPARENCY"]) == ["R-VALUE"], "transparency %s is refused as R-VALUE" % json.dumps(badt))
@@ -882,6 +988,8 @@ def self_test():
     refused({"geometryType": "esriGeometryEnvelope"}, "R-GEOMETRY", "an envelope layer")
     refused({"geometryType": ["x"]}, "R-GEOMETRY", "a list geometry type")
     refused({"geometryType": "esriGeometryPoint"}, "R-INPUT", "a layer with no drawingInfo")
+    check('{"a": 2, "b": 1}' in conv({"error": {"b": 1, "a": 2}}).refusals[0][2],
+          "the error body is quoted with sorted keys, so the report does not depend on the service's key order")
     refused(_lyr("esriGeometryPoint", None), "R-RENDERER", "a null renderer")
     refused(_lyr("esriGeometryPoint", {"type": "heatmap"}), "R-RENDERER", "a heatmap renderer")
     refused(_lyr("esriGeometryPoint", {"type": ["x"]}), "R-RENDERER", "a list renderer type")
@@ -966,6 +1074,21 @@ def self_test():
     check(_drawn(num.layers, {"CODE": "1"}) == ["layer-2-circle"], "a text attribute '1' does not match an integer class: types are strict")
     flo = conv(_lyr("esriGeometryPoint", _uv([{"value": "1.5", "symbol": _sms()}], field="AREA")))
     check(_drawn(flo.layers, {"AREA": 1.5}) == ["layer-0-circle"], "a double field matches the number 1.5")
+    fd = conv(_lyr("esriGeometryPoint", _uv([{"value": "1.5", "symbol": _sms()}, {"value": "2.5", "symbol": _sms()}],
+                                            field="AREA", default=_sms())))
+    check(not fd.refusals and fd.layers[2]["filter"] == ["all", ["!=", ["get", "AREA"], 1.5], ["!=", ["get", "AREA"], 2.5]],
+          "a double field's default class excludes the classes with != because match rejects 1.5 as a label" + PIN)
+    holds(lambda: [_drawn(fd.layers, {"AREA": v}) for v in (1.5, 2.5, 9, None)] ==
+          [["layer-0-circle"], ["layer-1-circle"], ["layer-2-circle"], ["layer-2-circle"]] and _drawn(fd.layers, {}) == ["layer-2-circle"],
+          "on a double field 1.5 and 2.5 draw their class and any other or null value draws the default" + PIN)
+    holds(lambda: rules(_lyr("esriGeometryPoint", _uv([{"value": "9007199254740993", "symbol": _sms()}], field="CODE"))) == ["R-VALUE"],
+          "an integer class value beyond 2^53 is refused, because the filter and the tile would round it" + PIN)
+    big = conv(_lyr("esriGeometryPoint", _uv([{"value": "9007199254740993", "symbol": _sms()}], field="CODE")))
+    check("whole numbers up to 9007199254740991 only" in big.refusals[0][2], "the refusal of a too-large integer class value says the limit")
+    check("whole numbers" not in conv(_lyr("esriGeometryPoint", _uv([{"value": "x", "symbol": _sms()}], field="AREA"))).refusals[0][2],
+          "the whole-number note is only on integer fields")
+    holds(lambda: rules(_lyr("esriGeometryPoint", _uv([{"value": "9" * 5000, "symbol": _sms()}], field="CODE"))) == ["R-VALUE"],
+          "an integer class value of 5000 digits is refused as R-VALUE, not an int() crash" + PIN)
     refused(_lyr("esriGeometryPoint", _uv([{"value": "1", "symbol": _sms()}, {"value": "01", "symbol": _sms()}], field="CODE")),
             "R-VALUE", "two class values that are the same integer" + PIN)
     refused(_lyr("esriGeometryPoint", _uv([{"value": "A", "symbol": _sms()}, {"value": "A", "symbol": _sms()}])), "R-VALUE", "a repeated class value")
@@ -987,6 +1110,35 @@ def self_test():
     refused(_lyr("esriGeometryPoint", _uv([{"value": "A", "symbol": _sms(style="esriSMSX")}])), "R-MARKER-SHAPE", "a refused symbol inside a class")
     both_bad = rules(_lyr("esriGeometryPoint", _uv([{"value": "A", "symbol": _sms(style="esriSMSX")}, {"value": "B", "symbol": _sms(size=0)}])))
     check(both_bad == ["R-MARKER-SHAPE", "R-VALUE"], "every refusal is reported in one run, not only the first")
+    tri = _sms(style="esriSMSTriangle")
+    check(rules(_lyr("esriGeometryPoint", _uv([{"value": "A", "symbol": tri}], field2="CODE"))) == ["R-MARKER-SHAPE", "R-UV-MULTIFIELD"],
+          "a multi-field renderer still reports the refusals of its symbols" + PIN)
+    check(rules(_lyr("esriGeometryPoint", _uv([{"value": "A", "symbol": tri}], field="NOPE"))) == ["R-FIELD-TYPE", "R-MARKER-SHAPE"],
+          "a field type refusal still reports the refusals of its symbols" + PIN)
+    check(rules(_lyr("esriGeometryPoint", _uv([{"value": "A", "symbol": tri}], valueExpression="$feature.A", field=None))) == ["R-MARKER-SHAPE", "R-UV-ARCADE"],
+          "an Arcade renderer reports its symbols and no field refusal" + PIN)
+    check(rules(_lyr("esriGeometryPoint", _uv([{"value": "A", "symbol": _sms()}], uniqueValueGroups=[{"classes": []}], default=tri))) == ["R-MARKER-SHAPE", "R-UV-GROUPS"],
+          "a grouped renderer still reports the refusal of its default symbol" + PIN)
+    hat = _sfs(style="esriSFSCross")
+    check(rules(_lyr("esriGeometryPolygon", _cb([{"classMaxValue": 10, "symbol": hat}], normalizationType="esriNormalizeByLog")), ["R-CB-BOUNDARY"]) == ["R-CB-NORMALIZE", "R-FILL-HATCH"],
+          "a normalized class break renderer still reports the refusals of its symbols" + PIN)
+    check(rules(_lyr("esriGeometryPolygon", _cb([{"classMaxValue": 10, "symbol": hat}], field="KIND")), ["R-CB-BOUNDARY"]) == ["R-FIELD-TYPE", "R-FILL-HATCH"],
+          "a class break field refusal still reports the refusals of its symbols" + PIN)
+    check(rules(_lyr("esriGeometryPolygon", _cb([{"classMaxValue": "x", "symbol": _sfs()}, {"classMaxValue": 20, "symbol": hat}, "x"], defaultSymbol=hat)), ["R-CB-BOUNDARY"]) == ["R-FILL-HATCH", "R-VALUE"],
+          "a bad class bound does not hide the symbol refusals of the classes after it" + PIN)
+    check(rules(_lyr("esriGeometryPolygon", _cb([{"classMaxValue": 10, "symbol": hat}], minValue=None)), ["R-CB-BOUNDARY"]) == ["R-FILL-HATCH", "R-VALUE"],
+          "a missing minValue still reports the refusals of the symbols" + PIN)
+    ahead = _lyr("esriGeometryPolygon", _cb([{"classMaxValue": 10, "symbol": _sfs()}, {"classMaxValue": 5, "symbol": hat}, {"classMaxValue": 30, "symbol": hat}]))
+    check(rules(ahead, ["R-CB-BOUNDARY"]) == ["R-CB-ORDER", "R-FILL-HATCH"] and len(conv(ahead, accepted=["R-CB-BOUNDARY"]).refusals) == 3,
+          "a class order refusal does not hide the symbol refusals after it" + PIN)
+    vpts = _lyr("esriGeometryPoint", _uv([
+        {"value": "gate", "label": "gate valve", "symbol": _sms(color=[200, 0, 0, 255])},
+        {"value": "check", "label": "check valve", "symbol": _sms(style="esriSMSTriangle", color=[0, 0, 200, 255])},
+        {"value": "blowoff", "label": "blow-off", "symbol": _sms(style="esriSMSX", color=[0, 0, 0, 255])}]))
+    vres = convert(vpts)
+    check(sorted(r[0] for r in vres.refusals) == ["R-MARKER-SHAPE"] * 2 + ["R-MARKER-SIZE"] * 3 and describe(vres)[-1] == "5 refusal(s). No style was produced.",
+          "the README's valve layer reports 5 refusals: R-MARKER-SIZE on each marker and R-MARKER-SHAPE on the triangle and the X")
+    check(sorted(r[0] for r in conv(vpts).refusals) == ["R-MARKER-SHAPE"] * 2, "accepting R-MARKER-SIZE leaves the 2 shape refusals")
 
     # ---- class breaks
     acc = ["R-CB-BOUNDARY"]
@@ -1028,6 +1180,24 @@ def self_test():
     refused(_lyr("esriGeometryPolygon", _cb([{"classMaxValue": 10, "symbol": _sfs()}, {"classMaxValue": 10, "symbol": _sfs()}])),
             "R-CB-ORDER", "two classes with the same max", acc)
     refused(_lyr("esriGeometryPolygon", _cb([{"classMaxValue": -5, "symbol": _sfs()}], minValue=0)), "R-CB-ORDER", "a first max below minValue", acc)
+    gap = _lyr("esriGeometryPolygon", _cb([{"classMaxValue": 10, "classMinValue": 0, "symbol": _sfs()}, {"classMaxValue": 20, "classMinValue": 15, "symbol": _sfs()}]))
+    check(rules(gap, acc) == ["R-CB-ORDER"] and conv(gap, accepted=acc).layers == [] and "does not meet the bound before it" in conv(gap, accepted=acc).refusals[0][2],
+          "a gap between two classes is refused: the tool would draw value 12 in class 2" + PIN)
+    check(rules(_lyr("esriGeometryPolygon", _cb([{"classMaxValue": 10, "symbol": _sfs()}, {"classMaxValue": 20, "classMinValue": 5, "symbol": _sfs()}])), acc) == ["R-CB-ORDER"],
+          "an overlap between two classes is refused" + PIN)
+    check(rules(_lyr("esriGeometryPolygon", _cb([{"classMaxValue": 10, "classMinValue": 3, "symbol": _sfs()}])), acc) == ["R-CB-ORDER"],
+          "a first classMinValue that is not minValue is refused" + PIN)
+    check(rules(_lyr("esriGeometryPolygon", _cb([{"classMaxValue": 10, "symbol": _sfs()}, {"classMaxValue": 12, "classMinValue": 12, "symbol": _sfs()}])), acc) == ["R-CB-ORDER"],
+          "a classMinValue equal to its own classMaxValue after a gap is refused" + PIN)
+    for label, infos in (
+            ("a classMinValue above classMaxValue", [{"classMaxValue": 10, "classMinValue": 11}, {"classMaxValue": 20, "classMinValue": 11}]),
+            ("a classMaxValue that is not above the one before", [{"classMaxValue": -5}, {"classMaxValue": -9}]),
+            ("a gap", [{"classMaxValue": 10}, {"classMaxValue": 20, "classMinValue": 15}, {"classMaxValue": 40, "classMinValue": 30}]),
+            ("a text classMaxValue", [{"classMaxValue": "x"}, {"classMaxValue": -1}])):
+        check(len(conv(_lyr("esriGeometryPolygon", _cb([dict(i, symbol=_sfs()) for i in infos])), accepted=acc).refusals) == 1,
+              "after %s the later class bounds are not checked, so one bound problem is one refusal" % label)
+    same = conv(_lyr("esriGeometryPolygon", _cb([{"classMaxValue": 10, "classMinValue": 10, "symbol": _sfs()}], minValue=10)), accepted=acc)
+    check(not same.refusals and len(same.layers) == 1, "classMinValue equal to classMaxValue is a valid one value class" + PIN)
     one = conv(_lyr("esriGeometryPolygon", _cb([{"classMaxValue": 0, "symbol": _sfs()}], minValue=0)), accepted=acc)
     check(not one.refusals and _drawn(one.layers, {"AREA": 0}) == ["layer-0-fill"], "a first max equal to minValue is a one value class")
 
@@ -1070,12 +1240,16 @@ def self_test():
         status, out, err = _run(["--layer-json", src, "--apply"])
         check(status == 64 and "--out" in err, "--apply without --out is a usage error")
         status, out, err = _run(["--layer-json", src, "--out", dest, "--apply"])
-        written = io.open(dest, "r", encoding="utf-8").read()
+        with io.open(dest, "r", encoding="utf-8") as handle:
+            written = handle.read()
         check(status == 0 and json.loads(written) == convert(_simple_fill()).layers and "wrote 1 layer(s)" in out,
               "--apply writes the converted layers")
+        check(written == json.dumps(convert(_simple_fill()).layers, indent=2, sort_keys=True) + "\n",
+              "the written file is indented JSON with sorted keys and one final newline, so two runs give identical bytes")
         digest = hashlib.sha256(written.encode("utf-8")).hexdigest()
         status, out, err = _run(["--layer-json", src, "--out", dest, "--apply"])
-        again = io.open(dest, "r", encoding="utf-8").read()
+        with io.open(dest, "r", encoding="utf-8") as handle:
+            again = handle.read()
         check(status == 2 and "cannot create" in err, "--apply never overwrites an existing file" + PIN)
         check(hashlib.sha256(again.encode("utf-8")).hexdigest() == digest, "the existing file is byte for byte unchanged" + PIN)
         missing = os.path.join(tmp, "no" + os.sep + "such" + os.sep + "out.json")
@@ -1086,6 +1260,14 @@ def self_test():
             handle.write(u"{not json")
         status, out, err = _run(["--layer-json", bad])
         check(status == 2 and "cannot read" in err, "a malformed layer file is exit 2")
+        deep = os.path.join(tmp, "deep.json")
+        with io.open(deep, "w", encoding="utf-8") as handle:
+            handle.write(u"[" * 100000)
+        def nested():
+            st, o, e = _run(["--layer-json", deep])
+            return st == 2 and "RecursionError" in e
+
+        holds(nested, "JSON nested 100000 deep is exit 2 with the error class, not a traceback and exit 1" + PIN)
         status, out, err = _run(["--layer-json", os.path.join(tmp, "absent.json")])
         check(status == 2 and "cannot read" in err, "a missing layer file is exit 2")
         refuse_src = os.path.join(tmp, "refuse.json")
@@ -1132,30 +1314,58 @@ def self_test():
     thread.daemon = True
     thread.start()
     base = "http://127.0.0.1:%d" % server.server_address[1]
+    # urllib honours HTTP_PROXY and the Windows proxy settings, so on a proxied workstation the stub request
+    # would go to the proxy. The test opener ignores every proxy, and a dead proxy is set to prove it.
+    real_open = _OPEN
+    _OPEN = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+    saved = dict((k, os.environ.get(k)) for k in ("HTTP_PROXY", "http_proxy"))
+    os.environ["HTTP_PROXY"] = os.environ["http_proxy"] = "http://127.0.0.1:9"
     try:
         status, out, err = _run(["--url", base + "/ok/FeatureServer/0"])
-        check(status == 0 and "1 layer(s) converted." in out, "--url fetches a layer and converts it")
-        check(_Stub.seen[-1] == "/ok/FeatureServer/0?f=json", "the request asks for f=json")
+        check(status == 0 and "1 layer(s) converted." in out, "--url fetches a layer and converts it, whatever proxy is configured" + PIN)
+        check(_Stub.seen[-1:] == ["/ok/FeatureServer/0?f=json"], "the request asks for f=json")
         _run(["--url", base + "/ok/FeatureServer/0?f=html&x=1"])
-        check(_Stub.seen[-1] == "/ok/FeatureServer/0?x=1&f=json", "a caller's own f= is replaced by f=json and other parameters stay" + PIN)
+        check(_Stub.seen[-1:] == ["/ok/FeatureServer/0?x=1&f=json"], "a caller's own f= is replaced by f=json and other parameters stay" + PIN)
         status, out, err = _run(["--url", base + "/err/FeatureServer/0"])
         check(status == 1 and "R-INPUT" in out and "Token Required" in out, "a 200 answer with an error body is refused, not converted" + PIN)
         status, out, err = _run(["--url", base + "/html/FeatureServer/0"])
         check(status == 2 and "cannot read" in err, "an answer that is not JSON is exit 2")
         status, out, err = _run(["--url", base + "/nothing/FeatureServer/0"])
         check(status == 2 and "404" in err, "an HTTP 404 is exit 2")
-        raises(lambda: _fetch(base + "/big/FeatureServer/0", limit=10), "an answer above the size limit is refused")
+        raises(lambda: _fetch(base + "/big/FeatureServer/0", limit=10), "an answer above the size limit is refused", "larger than")
+        holds(lambda: _fetch(base + "/ok/FeatureServer/0", limit=len(layer_body)) == _simple_fill(),
+              "an answer of exactly the size limit is read" + PIN)
+        raises(lambda: _fetch(base + "/ok/FeatureServer/0", limit=len(layer_body) - 1),
+               "an answer one byte over the size limit is refused" + PIN, "larger than")
         raises(lambda: _fetch("file:///etc/passwd"), "a file: URL is refused" + PIN)
         raises(lambda: _fetch("ftp://127.0.0.1/x"), "an ftp: URL is refused")
         status, out, err = _run(["--url", "file:///etc/passwd"])
         check(status == 2 and "only http and https" in err, "the CLI refuses a file: URL with exit 2" + PIN)
+        def garbage():
+            st, o, e = _run(["--url", base + "/garbage/FeatureServer/0"])
+            return st == 2 and "BadStatusLine" in e and "Traceback" not in e
+
+        holds(garbage, "a server that does not speak HTTP is exit 2 with the error class, not a traceback and exit 1" + PIN)
+        secret = base + "/a b/FeatureServer/0?token=SECRET123"
+
+        def spaced():
+            st, o, e = _run(["--url", secret])
+            return st == 2 and "InvalidURL" in e and "SECRET123" not in o + e
+
+        holds(spaced, "a URL with a space is exit 2 and the error text does not repeat the URL or its token" + PIN)
         probe_url = base + "/ok/FeatureServer/0"
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
-    status, out, err = _run(["--url", probe_url])
-    check(status == 2 and "cannot read" in err, "a stopped service is exit 2")
+    try:
+        status, out, err = _run(["--url", probe_url])
+        check(status == 2 and "cannot read" in err, "a stopped service is exit 2")
+    finally:
+        _OPEN = real_open
+        for name in saved:
+            os.environ.pop(name, None)
+        os.environ.update((k, v) for k, v in saved.items() if v is not None)
 
     return h.footer()
 
@@ -1214,6 +1424,11 @@ def main(argv=None):
         info = _load(args)
     except (OSError, ValueError) as exc:
         print("error: cannot read the layer definition: %s" % exc, file=sys.stderr)
+        return 2
+    except Exception as exc:
+        # http.client errors (BadStatusLine, InvalidURL) and RecursionError from deep JSON. Print the
+        # class only: the text of InvalidURL holds the whole request URL, which can carry a token.
+        print("error: the layer definition could not be read (%s)." % type(exc).__name__, file=sys.stderr)
         return 2
 
     result = convert(info, args.source, args.source_layer, args.id_prefix, accepted)
