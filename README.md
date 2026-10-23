@@ -14,13 +14,16 @@ property, or where the Esri reference does not say what a value means, is a name
 rule stops, prints the rule and the JSON path, exits 1 and produces no style:
 
 ```
-$ python renderport.py --layer-json valves.json
+$ python renderport.py --layer-json valves.json --accept R-MARKER-SIZE
 REFUSED  R-MARKER-SHAPE  renderer.uniqueValueInfos[1].symbol
     a MapLibre circle layer draws only circles -- style "esriSMSTriangle"
 REFUSED  R-MARKER-SHAPE  renderer.uniqueValueInfos[2].symbol
     a MapLibre circle layer draws only circles -- style "esriSMSX"
+ACCEPTED R-MARKER-SIZE: the Esri reference does not say whether a marker size is a diameter or includes the outline, and MapLibre draws a circle stroke outside circle-radius
 2 refusal(s). No style was produced.
 ```
+
+Without `--accept R-MARKER-SIZE` the same layer reports 5 refusals, because every marker needs that rule.
 
 Every refusal is reported in one run, not only the first. Five rules describe an approximation that is often
 acceptable, such as a line cap. Those you can accept one at a time with `--accept`. The accepted rule is printed
@@ -29,8 +32,10 @@ and is written into each layer's `metadata`.
 ## The existing alternative
 
 Searched on 2026-10-22 with `gh search repos` for `renderport`, `esri maplibre`, `esri mapbox style`,
-`arcgis mapbox-gl`, `esri2mapbox`, `esri-to-mapbox` and `arcgis renderer`. Nothing with this name or purpose came
-back. These are the nearest, and I read only their READMEs and descriptions, not their source:
+`arcgis mapbox-gl`, `esri2mapbox`, `esri-to-mapbox` and `arcgis renderer maplibre`. Several unrelated repositories
+share the name renderport (portfolio sites), and this repository is one of the hits. No result described a
+converter that refuses what it cannot draw, but I read only descriptions and READMEs, never source, so I cannot rule
+one out. These are the nearest:
 
 - [bojko108/ol-esri-style](https://github.com/bojko108/ol-esri-style) turns an Esri style definition into an
   OpenLayers style function, in the browser, from a layer URL in one call. It also handles labels. It targets
@@ -38,6 +43,10 @@ back. These are the nearest, and I read only their READMEs and descriptions, not
 - [muimsd/esri-gl](https://github.com/muimsd/esri-gl) and
   [frontiersi/mapbox-gl-esri-sources](https://github.com/frontiersi/mapbox-gl-esri-sources) let mapbox-gl or
   maplibre-gl read Esri services as sources. They solve the data side. They are not a symbology converter.
+- [ZhouGYong/Esri2MapboxGL](https://github.com/ZhouGYong/Esri2MapboxGL) and
+  [timkeane/esri-mapbox-style](https://github.com/timkeane/esri-mapbox-style) match the search terms by name. Neither
+  has a description. I read only the first README, which lists a `style.json`. I did not check what either does with a
+  symbol it cannot draw.
 - ArcGIS's own tools publish vector tile packages with an Esri style. That keeps the Esri look inside Esri
   clients, which is the better choice when you stay on ArcGIS.
 
@@ -98,7 +107,7 @@ Rules marked "accept" can be passed to `--accept`. The others always refuse, bec
 | `R-SYMBOL-TYPE` | no | The symbol is not the simple marker, line or fill that matches the geometry. |
 | `R-PICTURE` | no | Picture markers and fills need a sprite image. |
 | `R-MARKER-SHAPE` | no | A circle layer draws only circles. Cross, diamond, square, triangle and X are refused. |
-| `R-MARKER-OUTLINE` | accept | MapLibre draws a circle stroke outside `circle-radius`. The Esri reference does not say whether the size includes the outline. |
+| `R-MARKER-SIZE` | accept | MapLibre draws a circle stroke outside `circle-radius`. The Esri reference does not say whether the size is a diameter or includes the outline. Every marker needs this rule. |
 | `R-OFFSET` | no | The Esri reference does not say which direction a positive offset moves. |
 | `R-LINE-DASH` | no | The Esri reference does not define the dash lengths of its named styles. |
 | `R-LINE-CAP-JOIN` | accept | The REST line symbol has no cap or join. Accepting emits `round` for both. |
@@ -113,12 +122,14 @@ Rules marked "accept" can be passed to `--accept`. The others always refuse, bec
 | `R-CB-BOUNDARY` | accept | The Esri reference does not say whether a class bound is inclusive. |
 | `R-CB-ORDER` | no | Class maximums must rise strictly from `minValue`. |
 | `R-LABELS` | no | Label placement and label expressions. |
-| `R-SCALE-SYMBOLS` | no | `scaleSymbols: true` means symbols scale with the map. |
+| `R-SCALE-SYMBOLS` | no | Any `scaleSymbols` value, true or false. The property name says symbols scale, and the Esri page says they keep one screen size. The two readings are opposite. |
 | `R-SCALE-RANGE` | accept | The reference does not define the direction of `minScale` and `maxScale` or the meaning of 0. |
+| `R-LAYER-FILTER` | no | A non-empty `definitionExpression`, or a `defaultVisibility` other than true. The service hides features, and the emitted layers would draw them. |
 | `R-LAYER-TRANSPARENCY` | accept | MapLibre alpha is per feature. The reference does not say how layer transparency composites. |
 
-What does convert without a rule: a circle marker with no outline, a solid line or solid fill (the line rules
-above still apply), and a null line, null fill or null outline, which draw nothing in both systems. A unique
+What does convert without a rule: a solid fill, a null line, a null fill and a null fill outline, which draw nothing
+in both systems. A marker always needs `--accept R-MARKER-SIZE`, and a line needs `--accept R-LINE-CAP-JOIN`.
+A marker whose outline is null is refused as `R-VALUE`. A unique
 value or class break renderer becomes one layer per class, each with a `filter`.
 
 ## What was checked, and against what
@@ -132,7 +143,7 @@ Each fact below was read from the cited page on 2026-10-22. Where the page is si
 | Color is `[r, g, b, a]`, each 0 to 255. A symbol with no color has a null color. | [Symbol objects](https://developers.arcgis.com/rest/services-reference/enterprise/symbol-objects/) |
 | Class break bounds: the page documents `minValue` and `classMaxValue` and gives no inclusive or exclusive wording. | [Renderer objects](https://developers.arcgis.com/rest/services-reference/enterprise/renderer-objects/), [classBreaksRenderer](https://developers.arcgis.com/web-map-specification/objects/classBreaksRenderer/) |
 | Unique value renderers have `field1` to `field3`, `valueExpression` (Arcade) and `uniqueValueGroups`. | [uniqueValueRenderer](https://developers.arcgis.com/web-map-specification/objects/uniqueValueRenderer/) |
-| `drawingInfo.transparency` runs from 0 (none) to 100 (fully transparent). `scaleSymbols` says whether symbols keep the same screen size. | [drawingInfo](https://developers.arcgis.com/web-map-specification/objects/drawingInfo/) |
+| `drawingInfo.transparency` runs from 0 (none) to 100 (fully transparent). `scaleSymbols` is described as whether symbols "stay the same size in screen units as you zoom in", which the property name contradicts. | [drawingInfo](https://developers.arcgis.com/web-map-specification/objects/drawingInfo/) |
 | `minScale` and `maxScale` are described with wording that does not settle direction. The page does not say what 0 means. | [layerDefinition](https://developers.arcgis.com/web-map-specification/objects/layerDefinition/) |
 | A layer answers `?f=json`. | [Feature layer](https://developers.arcgis.com/rest/services-reference/enterprise/layer-feature-service/) |
 | The JavaScript line symbol defaults `cap` and `join` to `round`. | [SimpleLineSymbol](https://developers.arcgis.com/javascript/latest/references/core/symbols/SimpleLineSymbol/) |
@@ -170,12 +181,13 @@ PASS  the abbreviation --ap of --apply is refused by the parser  <-- pinned defe
 PASS  a 200 answer with an error body is refused, not converted  <-- pinned defect
 ...
 --------------------------------------------------------------------
-221 assertions, 0 failed
+286 assertions, 0 failed
 ```
 
-Windows Python 3.13.2 and Linux Python 3.12.3 print the same 221 assertions, and the full output of the two
-hosts is byte for byte identical (compared with `diff`). Branch coverage is 100 percent:
-`coverage run --branch renderport.py --self-test` reports 881 statements, 238 branches, 0 missed. The only line
+Windows Python 3.13.2, Linux Python 3.12.3, and Windows Python 3.9.25 and 3.10.20 print the same 286 assertions.
+The Windows output has CRLF line ends and the Linux output has LF, so the two files match after you strip the CR
+(compared with `cmp`). Branch coverage is 100 percent:
+`coverage run --branch renderport.py --self-test` reports 1045 statements, 264 branches, 0 missed. The only line
 that the run does not execute is the `if __name__ == "__main__"` guard, marked `# pragma: no cover`.
 Linux has no `coverage` module installed, so coverage was measured on Windows only.
 
@@ -197,8 +209,9 @@ Linux has no `coverage` module installed, so coverage was measured on Windows on
 | A 200 answer holding `error` is refused. | Self-test, the stub answers `{"error": {"code": 499}}`. |
 | A non-JSON answer, a 404, a stopped service and an oversize answer are exit 2 or an error. | Self-test, the stub and a shut-down stub. |
 | `file:` and `ftp:` URLs are refused. | Self-test. |
-| The tool does not crash on malformed JSON. | Not in the self-test. A scratch fuzz run mutated four fixture layers 8000 times each, with and without every acceptable rule (32000 conversions), and raised nothing. |
-| The self-test can fail. | A scratch run changed one line at a time in 17 places (unit factor, radius, `allow_abbrev`, the exclusive-create write, the URL scheme test, a class bound, the error-body test, integer parsing, duplicate detection, the typed `match`, labels, the zoom constant, the offset test, the exit code, a null guard, the size test, the `--apply` guard). All 17 failed the self-test. |
+| The tool does not crash on malformed JSON. | Not in the self-test, and the claim is false for absurd numbers (see Limits). A scratch fuzz run mutated four fixture layers 8000 times each (32000 conversions) before the latest rules were added. The scratch script is not in the repository, so you cannot rerun it. |
+| A layer with a filter or a scaleSymbols value is refused. | Self-test, `R-LAYER-FILTER` and `R-SCALE-SYMBOLS` fixtures for each value, and clean cases for absent, null, empty and true. |
+| The self-test can fail. | A scratch run, not kept in the repository, changed one line at a time in 17 places (unit factor, radius, `allow_abbrev`, the exclusive-create write, the URL scheme test, a class bound, the error-body test, integer parsing, duplicate detection, the typed `match`, labels, the zoom constant, the offset test, the exit code, a null guard, the size test, the `--apply` guard). All 17 failed the self-test. A later sweep of the decision core found two lines no assertion pinned, and the self-test now pins both. |
 
 ## Limits
 
@@ -212,15 +225,61 @@ Linux has no `coverage` module installed, so coverage was measured on Windows on
 - The tiles must keep the attribute types listed in `fields`. A tile pipeline that turns every attribute into text
   breaks the numeric matches, and no check here can see that.
 - An absent `defaultSymbol` is read as "draw nothing for unmatched features". The REST reference does not say so.
-  An absent `scaleSymbols` is read as fixed screen size.
+  An absent or null `scaleSymbols` is not refused, and the tool draws fixed-size circles and lines.
 - Field names match exactly, including case.
-- `definitionExpression`, time settings and other layer-level keys outside `drawingInfo` are not read.
+- Layer-level keys outside `drawingInfo` are not read, except that a non-empty `definitionExpression` and a
+  `defaultVisibility` other than true are refused as `R-LAYER-FILTER`. Time settings and other keys convert clean.
 - A secured service needs a saved copy: the tool has no credential flag. Save the JSON and use `--layer-json`.
 - The conversion constant for scale assumes 96 dpi and the standard web mercator scheme. Zoom is clamped to 0
   to 24. MapLibre hides a layer at `maxzoom` itself, so a layer is hidden one step early at that exact zoom.
-- Python 3.9 was not run. The file was parsed with `ast` using `feature_version=(3, 9)` and uses no later
-  syntax, but the self-test ran on 3.12 and 3.13 only.
+- The self-test also ran green with the same count on Windows CPython 3.9.25 and 3.10.20.
 - Marker `angle` is ignored because a circle looks the same turned. Rotation expressions are refused.
+- A JSON number of about 309 digits or more (a marker size, a class bound or a `minScale` written as `10**400`)
+  raises `OverflowError` in the converter and ends in a traceback with exit 1.
+- A marker size or line width above about 1.3e308 points converts without a refusal and writes the invalid JSON
+  token `Infinity`. A marker size below about 0.00008 points rounds to a circle radius of 0, so nothing draws, and no
+  rule refuses it.
+- A renderer label that holds the JSON literal `NaN` or `Infinity` is copied into layer metadata, so `--apply` can
+  write a file that is not valid JSON.
+- An unread symbol, renderer or `drawingInfo` key with non-ASCII characters is printed raw by `R-UNREAD-KEY`. On a
+  Windows pipe or redirect that uses cp1252 this raises `UnicodeEncodeError`, and the traceback exits 1.
+- Any uncaught exception exits 1, which is also the exit code of a refusal, so a caller cannot tell a crash from a
+  clean refusal by the exit code alone.
+- Exit code 2 covers input and output failures and parser errors (an unknown or abbreviated flag). Only the tool's
+  own usage checks return 64.
+- Output paths that are devices or streams behave by platform. `--out NUL` on Windows reports `wrote 1 layer(s)` and
+  discards the data, `--out con` ends in a `ValueError` traceback, and `--out name.json:stream` creates an empty
+  `name.json` plus an NTFS alternate stream.
+- A write that fails part way, such as a full disk, leaves a partial `--out` file, because the file is created before
+  it is written, and the tool exits 2.
+- A layer file saved with a UTF-8 BOM or as UTF-16 (the Windows PowerShell 5 default) is refused with exit 2. The BOM
+  message names the fix. The UTF-16 message does not. Resave the file as plain UTF-8.
+- `drawingInfo.showLabels` and `fixedSymbols` are accepted without a refusal, and no label layers are emitted, so a
+  layer that shows labels converts with them missing when `labelingInfo` is null.
+- The Esri reference is silent on how a null attribute matches a unique value class. A class value of empty text or
+  `<Null>` is read as that literal text, so a feature with a null attribute draws the default symbol, and no rule
+  refuses it.
+- A float class value written as `1_000` is accepted as 1000.0, because Python `float()` allows underscores. An
+  integer class value with a trailing newline (`5\n`) is accepted as 5, because the integer pattern ends with `$`.
+- JSON objects with duplicate keys keep the last value, with no refusal.
+- `--url` follows redirects, including an http to ftp redirect that `urllib` permits, so the fetch can reach a URL
+  taken from the server's reply. The query token is not copied to the new URL.
+- `--url` rebuilds the query with `parse_qsl`, so parameters with an empty value, such as `where=`, are dropped from
+  the request.
+- A token in the `--url` query goes over plain http if the URL says http, and it stays in shell history and the
+  process list. Credentials written as `user:password@host` are not supported: the whole userinfo string goes to the
+  system resolver as part of the host name, and some userinfo text is echoed in the "cannot read" error.
+- The first 200 characters of a service error body are printed on an `R-INPUT` refusal, so anything the server echoes
+  back in that body appears in the output.
+- A marker outline object without an explicit `"type": "esriSLS"`, or a null or absent marker outline, is refused as
+  `R-VALUE`, so some saved layer files need a hand edit before they convert.
+- The claim that `line-layer-opacity` exists only in MapLibre GL JS 6.0.0 and later depends on the cited
+  specification page staying current. The external citations in this file were not fetched again after the first
+  build.
+- Linux has no `coverage` module, so the 100 percent branch figure was measured on Windows only. `pyflakes` was also
+  run on Windows only.
+- The self-test opens about a dozen loopback connections. On a Windows host with no free ephemeral ports, two network
+  assertions can fail with `WinError 10048`, and a rerun passes.
 
 ## Contributing
 

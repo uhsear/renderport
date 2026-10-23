@@ -83,7 +83,8 @@ RULES = {
     "R-CB-BOUNDARY": (True, "the Esri reference does not say whether a class bound is inclusive, so a value on a bound may take the wrong class"),
     "R-CB-ORDER": (False, "class bounds must rise strictly from minValue, and each classMinValue must equal the bound before it, because the tool rebuilds contiguous classes and a gap or overlap would draw in the wrong class"),
     "R-LABELS": (False, "label placement and label expressions are not carried"),
-    "R-SCALE-SYMBOLS": (False, "symbols that scale with the map are not carried"),
+    "R-SCALE-SYMBOLS": (False, "the Esri property name and its documented description point opposite ways, so no scaleSymbols value can be read with confidence"),
+    "R-LAYER-FILTER": (False, "the layer hides or filters features at the service, and the emitted layers would draw every feature"),
     "R-SCALE-RANGE": (True, "the Esri reference does not define the direction of minScale and maxScale or the meaning of 0, and a scale-to-zoom conversion assumes 96 dpi"),
     "R-LAYER-TRANSPARENCY": (True, "MapLibre alpha is applied per feature and accumulates where features overlap, and the Esri reference does not say how layer transparency composites"),
 }
@@ -462,8 +463,14 @@ def _layer_checks(info, di, ctx):
         factor = 1 - t / 100.0
     if di.get("labelingInfo"):
         ctx.refuse("R-LABELS", "drawingInfo.labelingInfo")
-    if di.get("scaleSymbols") is True:
-        ctx.refuse("R-SCALE-SYMBOLS", "drawingInfo.scaleSymbols")
+    if di.get("scaleSymbols") is not None:
+        ctx.refuse("R-SCALE-SYMBOLS", "drawingInfo.scaleSymbols", "got %s; the property name says symbols scale, the Esri page says they keep one screen size" % json.dumps(di["scaleSymbols"])[:40])
+    expr = info.get("definitionExpression")
+    if expr is not None and not (isinstance(expr, str) and not expr.strip()):
+        ctx.refuse("R-LAYER-FILTER", "definitionExpression", "got %s" % json.dumps(expr)[:80])
+    vis = info.get("defaultVisibility")
+    if vis is not None and vis is not True:
+        ctx.refuse("R-LAYER-FILTER", "defaultVisibility", "got %s" % json.dumps(vis)[:40])
     extra = sorted(k for k in di if k not in _DI_KEYS)
     if extra:
         ctx.refuse("R-UNREAD-KEY", "drawingInfo", "unread: %s" % ", ".join(extra))
@@ -838,6 +845,8 @@ def self_test():
           and abs(_zoom(1128.497176) - 18.0) < 1e-4,
           "scale 295828763.8 (Esri level 1) is MapLibre zoom 0, and Esri level 19 (1128.5) is zoom 18" + PIN)
     check(_s(["x"]) == "" and _s("x") == "x", "_s keeps strings and blanks everything else")
+    check(_typed("0" * 19 + "1", "int") == 1 and _typed("0" * 20 + "1", "int") is None,
+          "an integer class value of 20 characters is read and one of 21 characters is refused" + PIN)
     check(_typed("9007199254740991", "int") == MAX_EXACT_INT and _typed("-9007199254740991", "int") == -MAX_EXACT_INT
           and _typed("9007199254740992", "int") is None and _typed("-9007199254740992", "int") is None,
           "an integer class value must be exact in JSON, so 2^53 - 1 is the limit" + PIN)
@@ -1046,7 +1055,19 @@ def self_test():
     ss["drawingInfo"]["scaleSymbols"] = True
     refused(ss, "R-SCALE-SYMBOLS", "symbols that scale with the map")
     ss["drawingInfo"]["scaleSymbols"] = False
-    check(not conv(ss).refusals, "scaleSymbols false is fixed screen size and converts")
+    refused(ss, "R-SCALE-SYMBOLS", "scaleSymbols false, which the cited Esri page reads the other way" + PIN)
+    ss["drawingInfo"]["scaleSymbols"] = None
+    check(not conv(ss).refusals, "a null scaleSymbols is the same as an absent one and converts")
+    check("got false" in conv(dict(ss, drawingInfo=dict(ss["drawingInfo"], scaleSymbols=False))).refusals[0][2],
+          "the scaleSymbols refusal quotes the value it saw")
+    for key, val, label in (("definitionExpression", "KIND = 'gate'", "a definition expression"),
+                            ("definitionExpression", ["x"], "a list definition expression"),
+                            ("defaultVisibility", False, "a layer hidden by default"),
+                            ("defaultVisibility", 1, "a numeric defaultVisibility")):
+        refused(dict(_simple_pt(), **{key: val}), "R-LAYER-FILTER", label + PIN)
+    for key, val in (("definitionExpression", ""), ("definitionExpression", "  "), ("definitionExpression", None),
+                     ("defaultVisibility", True), ("defaultVisibility", None)):
+        check(not conv(dict(_simple_pt(), **{key: val})).refusals, "%s %s is no filter and converts" % (key, json.dumps(val)))
     check(rules(_simple_pt()) == [], "the baseline fixture raises no refusal")
 
     # ---- unique value renderers
@@ -1095,6 +1116,8 @@ def self_test():
     refused(_lyr("esriGeometryPoint", _uv([{"value": "x", "symbol": _sms()}], field="CODE")), "R-VALUE", "a non-integer value on an integer field")
     refused(_lyr("esriGeometryPoint", _uv([{"value": 1, "symbol": _sms()}])), "R-VALUE", "a numeric JSON class value")
     refused(_lyr("esriGeometryPoint", _uv([5])), "R-VALUE", "a class that is not an object")
+    check([r[0] for r in conv(_lyr("esriGeometryPoint", _uv([5], default=_sms()))).refusals] == ["R-VALUE"],
+          "a class that is not an object is refused on its own line, even when a default symbol exists" + PIN)
     refused(_lyr("esriGeometryPoint", _uv("x")), "R-VALUE", "uniqueValueInfos that is not a list")
     refused(_lyr("esriGeometryPoint", _uv([{"value": "A", "symbol": _sms()}], field="MADE")), "R-FIELD-TYPE", "a date field")
     refused(_lyr("esriGeometryPoint", _uv([{"value": "A", "symbol": _sms()}], field="NOPE")), "R-FIELD-TYPE", "a field that is not listed")
